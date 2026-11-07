@@ -1,0 +1,388 @@
+name: Build APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Creer le projet Android
+        run: |
+          mkdir -p app/src/main/java/com/startrack/remote
+
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = 'StarTrackRemote'
+          include ':app'
+          EOF
+
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.5.2'
+          }
+
+          android {
+              namespace 'com.startrack.remote'
+              compileSdk 34
+
+              defaultConfig {
+                  applicationId 'com.startrack.remote'
+                  minSdk 24
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+              }
+
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.TRANSMIT_IR" />
+              <uses-feature
+                  android:name="android.hardware.consumerir"
+                  android:required="false" />
+
+              <application
+                  android:label="Telecommande STAR TRACK"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/startrack/remote/MainActivity.java <<'EOF'
+          package com.startrack.remote;
+
+          import android.app.Activity;
+          import android.content.Context;
+          import android.content.SharedPreferences;
+          import android.hardware.ConsumerIrManager;
+          import android.os.Bundle;
+          import android.os.Handler;
+          import android.os.Looper;
+          import android.text.InputType;
+          import android.view.View;
+          import android.view.ViewGroup;
+          import android.widget.Button;
+          import android.widget.EditText;
+          import android.widget.LinearLayout;
+          import android.widget.ScrollView;
+          import android.widget.TextView;
+
+          public class MainActivity extends Activity {
+
+              private static final int FREQ = 38000;
+
+              private static final String[][] BTNS = {
+                  {"Marche / Arrêt", "power"}, {"Muet", "mute"},
+                  {"Volume +", "volup"}, {"Volume -", "voldown"},
+                  {"Chaîne +", "chup"}, {"Chaîne -", "chdown"},
+                  {"▲", "up"}, {"▼", "down"},
+                  {"◀", "left"}, {"▶", "right"},
+                  {"OK", "ok"}, {"Menu", "menu"},
+                  {"Retour", "back"}, {"Source", "source"}
+              };
+
+              private ConsumerIrManager ir;
+              private SharedPreferences prefs;
+              private EditText addrField;
+              private TextView status;
+              private LinearLayout scanPanel;
+              private TextView scanInfo;
+              private final Handler handler = new Handler(Looper.getMainLooper());
+
+              private boolean scanning = false;
+              private String scanKey = "";
+              private String scanLabel = "";
+              private int scanAddr = 0;
+              private int scanCmd = 0;
+              private int candidate = 0;
+
+              @Override
+              protected void onCreate(Bundle savedInstanceState) {
+                  super.onCreate(savedInstanceState);
+                  ir = (ConsumerIrManager) getSystemService(Context.CONSUMER_IR_SERVICE);
+                  prefs = getSharedPreferences("remote", MODE_PRIVATE);
+
+                  ScrollView sv = new ScrollView(this);
+                  LinearLayout root = new LinearLayout(this);
+                  root.setOrientation(LinearLayout.VERTICAL);
+                  root.setPadding(dp(16), dp(24), dp(16), dp(24));
+                  sv.addView(root);
+                  setContentView(sv);
+
+                  TextView title = new TextView(this);
+                  title.setText("Télécommande STAR TRACK");
+                  title.setTextSize(22);
+                  root.addView(title);
+
+                  status = new TextView(this);
+                  status.setPadding(0, dp(8), 0, dp(8));
+                  root.addView(status);
+                  if (ir == null || !ir.hasIrEmitter()) {
+                      status.setText("Ce téléphone n'a pas d'émetteur infrarouge.");
+                  } else {
+                      status.setText("Prêt. Appui long sur un bouton pour le configurer.");
+                  }
+
+                  scanPanel = new LinearLayout(this);
+                  scanPanel.setOrientation(LinearLayout.VERTICAL);
+                  scanPanel.setVisibility(View.GONE);
+                  scanPanel.setPadding(0, dp(8), 0, dp(8));
+                  scanInfo = new TextView(this);
+                  scanPanel.addView(scanInfo);
+
+                  LinearLayout r1 = new LinearLayout(this);
+                  r1.addView(smallBtn("Ça a réagi !", v -> reacted()));
+                  r1.addView(smallBtn("Annuler", v -> cancelScan()));
+                  scanPanel.addView(r1);
+
+                  LinearLayout r2 = new LinearLayout(this);
+                  r2.addView(smallBtn("◀ -1", v -> stepCandidate(-1)));
+                  r2.addView(smallBtn("Tester", v -> sendNec(scanAddr, candidate)));
+                  r2.addView(smallBtn("+1 ▶", v -> stepCandidate(1)));
+                  scanPanel.addView(r2);
+
+                  LinearLayout r3 = new LinearLayout(this);
+                  r3.addView(smallBtn("Valider cette commande", v -> validate()));
+                  scanPanel.addView(r3);
+                  root.addView(scanPanel);
+
+                  TextView lbl = new TextView(this);
+                  lbl.setText("Adresse pour la recherche (hex) :");
+                  root.addView(lbl);
+                  addrField = new EditText(this);
+                  addrField.setInputType(InputType.TYPE_CLASS_TEXT
+                          | InputType.TYPE_TEXT_FLAG_CAP_CHARACTERS
+                          | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+                  addrField.setText(prefs.getString("addr", "00"));
+                  root.addView(addrField, new LinearLayout.LayoutParams(dp(120),
+                          ViewGroup.LayoutParams.WRAP_CONTENT));
+
+                  for (int i = 0; i < BTNS.length; i += 2) {
+                      LinearLayout row = new LinearLayout(this);
+                      for (int j = i; j < i + 2 && j < BTNS.length; j++) {
+                          row.addView(remoteBtn(BTNS[j][0], BTNS[j][1]));
+                      }
+                      root.addView(row);
+                  }
+              }
+
+              private int dp(int v) {
+                  return (int) (v * getResources().getDisplayMetrics().density);
+              }
+
+              private Button smallBtn(String text, View.OnClickListener l) {
+                  Button b = new Button(this);
+                  b.setText(text);
+                  b.setOnClickListener(l);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f);
+                  b.setLayoutParams(lp);
+                  return b;
+              }
+
+              private Button remoteBtn(final String label, final String key) {
+                  Button b = new Button(this);
+                  b.setText(label);
+                  b.setTextSize(16);
+                  LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                          0, dp(64), 1f);
+                  lp.setMargins(dp(4), dp(4), dp(4), dp(4));
+                  b.setLayoutParams(lp);
+                  b.setOnClickListener(v -> press(label, key));
+                  b.setOnLongClickListener(v -> {
+                      startScan(label, key);
+                      return true;
+                  });
+                  return b;
+              }
+
+              private void press(String label, String key) {
+                  int a = prefs.getInt("a_" + key, -1);
+                  int c = prefs.getInt("c_" + key, -1);
+                  if (a < 0 || c < 0) {
+                      status.setText(label + " : pas encore configuré. Appui long pour chercher la commande.");
+                      return;
+                  }
+                  if (sendNec(a, c)) {
+                      status.setText(label + " envoyé.");
+                  }
+              }
+
+              private void startScan(String label, String key) {
+                  int a;
+                  try {
+                      a = Integer.parseInt(addrField.getText().toString().trim(), 16) & 0xFFFF;
+                  } catch (NumberFormatException e) {
+                      status.setText("Adresse invalide. Écris par exemple 00 ou 04.");
+                      return;
+                  }
+                  prefs.edit().putString("addr", addrField.getText().toString().trim()).apply();
+                  handler.removeCallbacks(step);
+                  scanKey = key;
+                  scanLabel = label;
+                  scanAddr = a;
+                  scanCmd = 0;
+                  scanning = true;
+                  scanPanel.setVisibility(View.VISIBLE);
+                  status.setText("Recherche pour : " + label);
+                  handler.post(step);
+              }
+
+              private final Runnable step = new Runnable() {
+                  @Override
+                  public void run() {
+                      if (!scanning) return;
+                      if (scanCmd > 255) {
+                          scanning = false;
+                          scanInfo.setText("Terminé sans réaction. Essaie une autre adresse.");
+                          return;
+                      }
+                      sendNec(scanAddr, scanCmd);
+                      scanInfo.setText(scanLabel + " : test de la commande "
+                              + String.format("%02X", scanCmd) + " (adresse "
+                              + Integer.toHexString(scanAddr).toUpperCase() + ").\n"
+                              + "Appuie sur « Ça a réagi ! » dès que la télé réagit.");
+                      scanCmd++;
+                      handler.postDelayed(this, 900);
+                  }
+              };
+
+              private void reacted() {
+                  if (scanning) {
+                      scanning = false;
+                      handler.removeCallbacks(step);
+                      candidate = Math.max(0, Math.min(255, scanCmd - 1));
+                  }
+                  scanInfo.setText("Commande candidate : " + String.format("%02X", candidate)
+                          + ".\nUtilise ◀ -1 / +1 ▶ jusqu'à trouver la bonne, puis Valider.");
+              }
+
+              private void stepCandidate(int d) {
+                  candidate = (candidate + d + 256) % 256;
+                  scanInfo.setText("Commande candidate : " + String.format("%02X", candidate));
+                  sendNec(scanAddr, candidate);
+              }
+
+              private void validate() {
+                  prefs.edit()
+                          .putInt("a_" + scanKey, scanAddr)
+                          .putInt("c_" + scanKey, candidate)
+                          .apply();
+                  scanning = false;
+                  handler.removeCallbacks(step);
+                  scanPanel.setVisibility(View.GONE);
+                  status.setText(scanLabel + " enregistré.");
+              }
+
+              private void cancelScan() {
+                  scanning = false;
+                  handler.removeCallbacks(step);
+                  scanPanel.setVisibility(View.GONE);
+                  status.setText("Recherche annulée.");
+              }
+
+              private boolean sendNec(int addr, int cmd) {
+                  if (ir == null || !ir.hasIrEmitter()) {
+                      status.setText("Pas d'émetteur infrarouge sur ce téléphone.");
+                      return false;
+                  }
+                  try {
+                      ir.transmit(FREQ, necPattern(addr, cmd));
+                      return true;
+                  } catch (Exception e) {
+                      status.setText("Erreur d'envoi : " + e.getMessage());
+                      return false;
+                  }
+              }
+
+              // Protocole NEC : 9 ms + 4,5 ms, puis 32 bits (poids faible d'abord)
+              private static int[] necPattern(int addr, int cmd) {
+                  int c = cmd & 0xFF;
+                  long data;
+                  if (addr <= 0xFF) {
+                      int a = addr & 0xFF;
+                      data = (long) a
+                              | ((long) (~a & 0xFF) << 8)
+                              | ((long) c << 16)
+                              | ((long) (~c & 0xFF) << 24);
+                  } else {
+                      data = (long) (addr & 0xFFFF)
+                              | ((long) c << 16)
+                              | ((long) (~c & 0xFF) << 24);
+                  }
+                  int[] p = new int[67];
+                  int i = 0;
+                  p[i++] = 9000;
+                  p[i++] = 4500;
+                  for (int b = 0; b < 32; b++) {
+                      p[i++] = 560;
+                      p[i++] = (((data >> b) & 1L) == 1L) ? 1690 : 560;
+                  }
+                  p[i++] = 560;
+                  return p;
+              }
+          }
+          EOF
+
+      - name: Compiler l'APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Garder une copie de l'APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: startrack-remote
+          path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Publier l'APK dans les Releases
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk startrack-remote.apk
+          gh release create "v${{ github.run_number }}" startrack-remote.apk --title "Telecommande v${{ github.run_number }}" --notes "APK de test"
